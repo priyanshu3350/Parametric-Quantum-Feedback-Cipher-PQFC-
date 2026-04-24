@@ -1,95 +1,83 @@
-import json
 import socket
-import threading
+import struct
+import quantum_filtered_arx as q_arx
+import sys
 
+# Pre-shared Master Seed (Must be identical on both client and server)
+MASTER_SEED = 0xDEADC0DEBEEFCAFE1234567890ABCDEF
 
-# --- Logic from python_code/enc_dec.py ---
-def encryption(text, key=85):
-    ascii_text = [ord(char) for char in text]
-    a = 1664525
-    c = 1013904223
-    m = 256
-    shared_key = []
-    for _ in range(len(text)):
-        key = (key * a + c) % m
-        shared_key.append(key)
-    encrypted_text = [
-        char_val ^ key_val for char_val, key_val in zip(ascii_text, shared_key)
-    ]
-    return encrypted_text, shared_key
+def send_msg(sock, msg_bytes):
+    # Prefix each message with a 4-byte length (network byte order)
+    msg_bytes = struct.pack('>I', len(msg_bytes)) + msg_bytes
+    sock.sendall(msg_bytes)
 
+def recv_msg(sock):
+    # Read message length and unpack it into an integer
+    raw_msglen = recvall(sock, 4)
+    if not raw_msglen:
+        return None
+    msglen = struct.unpack('>I', raw_msglen)[0]
+    # Read the actual message data
+    return recvall(sock, msglen)
 
-def decryption(encrypted_text, shared_key):
-    decrypted_ascii = [
-        enc_val ^ key_val for enc_val, key_val in zip(encrypted_text, shared_key)
-    ]
-    return "".join(chr(val) for val in decrypted_ascii)
+def recvall(sock, n):
+    # Helper function to recv n bytes or return None if EOF is hit
+    data = bytearray()
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data.extend(packet)
+    return data
 
+import argparse
 
-# -------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Secure Quantum-ARX Client")
+    parser.add_argument("--host", default='127.0.0.1', help="Server IP to connect to (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=9999, help="Server port (default: 9999)")
+    args = parser.parse_args()
 
+    host = args.host
+    port = args.port
 
-def receive_messages(sock):
-    """
-    Listens for incoming messages, decrypts them, and prints them.
-    """
-    while True:
-        try:
-            data = sock.recv(4096)
-            if not data:
-                break
-
-            packet = json.loads(data.decode("utf-8"))
-            encrypted_text = packet["encrypted_text"]
-            shared_key = packet["shared_key"]
-
-            decrypted_msg = decryption(encrypted_text, shared_key)
-
-            print(f"\n\r[Server]: {decrypted_msg}")
-            print("You: ", end="", flush=True)
-
-        except ConnectionResetError:
-            break
-        except Exception as e:
-            print(f"Error receiving: {e}")
-            break
-
-
-def start_client():
-    host = input("Enter Server IP (or 'localhost'): ")
-    port = 65432
-
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    print(f"[*] Connecting to {host}:{port}")
+    print("[*] Type your message or 'exit' to quit.")
 
     try:
-        client.connect((host, port))
-        print("Connected to Server! Type messages below.")
-
-        # Start a separate thread to receive messages
-        thread = threading.Thread(target=receive_messages, args=(client,))
-        thread.daemon = True
-        thread.start()
-
-        # Main loop for sending messages
         while True:
-            msg = input("You: ")
-            if msg.lower() == "exit":
+            message_text = input("\n[>] Message: ")
+            if message_text.lower() in ['exit', 'quit']:
                 break
 
-            # 1. Encrypt
-            encrypted_text, shared_key = encryption(msg)
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                client_socket.connect((host, port))
 
-            # 2. Package
-            packet = {"encrypted_text": encrypted_text, "shared_key": shared_key}
+                # 1. Encrypt message
+                encrypted_data = q_arx.encrypt(message_text.encode('utf-8'), MASTER_SEED)
+                
+                # 2. Send encrypted message
+                send_msg(client_socket, encrypted_data)
 
-            # 3. Send
-            client.sendall(json.dumps(packet).encode("utf-8"))
+                # 3. Receive encrypted response
+                encrypted_response = recv_msg(client_socket)
+                if encrypted_response:
+                    # 4. Decrypt response
+                    decrypted_response = q_arx.decrypt(encrypted_response, MASTER_SEED)
+                    print(f"[!] Server Response: {decrypted_response.decode('utf-8')}")
 
-    except Exception as e:
-        print(f"Could not connect: {e}")
-    finally:
-        client.close()
+            except ConnectionRefusedError:
+                print("[!] Error: Could not connect to the server.")
+                break
+            finally:
+                client_socket.close()
 
+    except KeyboardInterrupt:
+        print("\n[*] Client exiting.")
 
 if __name__ == "__main__":
-    start_client()
+    main()
+
+if __name__ == "__main__":
+    main()

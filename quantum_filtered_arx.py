@@ -1,5 +1,6 @@
 import argparse
 import math
+import time
 from collections import Counter
 
 import numpy as np
@@ -10,17 +11,15 @@ from faker import Faker
 # Quantum Layer (PennyLane Implementation)
 # ==========================================
 
-dev_seed = qml.device("default.qubit", wires=8)
+dev_seed = qml.device("lightning.qubit", wires=8)
 # Initialize a 4-qubit quantum simulator device
-dev_dynamic = qml.device("default.qubit", wires=4)
+dev_dynamic = qml.device("lightning.qubit", wires=4)
 
 
 @qml.qnode(dev_seed, shots=1)
 def get_quantum_seed_block():
-    """Generates 8 bits of entropy via 4 Bell pairs."""
-    for i in range(0, 8, 2):
+    for i in range(8):
         qml.Hadamard(wires=i)
-        # qml.CNOT(wires=[i, i + 1])
     return [qml.sample(qml.PauliZ(i)) for i in range(8)]
 
 
@@ -60,7 +59,6 @@ def update_lcg_params(z_expects):
     """
     Generates new LCG parameters using sanitized quantum expectation values.
     """
-    # Explicitly cast through float to int to strip tensor/numpy types
     c_raw = int(float(abs(z_expects[0])) * (2**32 - 1))
     c_new = c_raw | 1  # Force odd
 
@@ -70,48 +68,16 @@ def update_lcg_params(z_expects):
     return a_new, c_new
 
 
-# def generate_qpp_sbox(z_expects):
-#     """
-#     Generates a dynamic Quantum Permutation Pad (QPP) / S-Box.
-#     """
-#     # Extract seed, strip types, and strictly bound it to 32-bit max for RandomState
-#     seed = int(float(abs(z_expects[2])) * (2**32 - 1)) % (2**32)
-#     rng = np.random.RandomState(seed)
-
-#     sbox = np.arange(256, dtype=np.uint8)
-#     rng.shuffle(sbox)
-#     return sbox
-
-
-def generate_qpp_sbox(z_expects, state_32bit):
+def generate_qpp_sbox(z_expects):
     """
-    Generates a dynamic S-Box using a Parameter-Free Quantum-Coupled Map.
-    Eliminates all arbitrary constants by tightly coupling the continuous
-    quantum expectation values with the discrete 32-bit classical state.
+    Generates a dynamic Quantum Permutation Pad (QPP) / S-Box.
     """
-    chaotic_sequence = np.zeros(256, dtype=np.float64)
+    # Extract seed, strip types, and strictly bound it to 32-bit max for RandomState
+    seed = int(float(abs(z_expects[2])) * (2**32 - 1)) % (2**32)
+    rng = np.random.RandomState(seed)
 
-    # Base continuous variables derived strictly from quantum measurements
-    q_val = float(z_expects[1])
-    q_step = float(z_expects[2])
-
-    for i in range(256):
-        # Extract a state byte (0-255) cyclically to act as a classical dynamic perturbator
-        state_byte = (state_32bit >> ((i % 4) * 8)) & 0xFF
-
-        # Non-linear coupling of quantum continuous space and classical discrete space.
-        # The division by 255.0 naturally scales the byte to  based on its 8-bit size.
-        q_val = np.sin(q_val + q_step + (state_byte / 255.0) * np.pi)
-
-        chaotic_sequence[i] = q_val
-
-        # Mutate the step using another qubit's expectation to guarantee chaotic divergence
-        q_step = np.cos(q_step + float(z_expects[i % 4]))
-
-    # Bridge the continuous domain to discrete cryptography via argsort.
-    # argsort mathematically guarantees a perfect bijection (0 to 255) with no missing bytes.
-    sbox = np.argsort(chaotic_sequence).astype(np.uint8)
-
+    sbox = np.arange(256, dtype=np.uint8)
+    rng.shuffle(sbox)
     return sbox
 
 
@@ -130,17 +96,22 @@ def rotr8(x, shift):
 def encrypt(plaintext, master_seed):
     ciphertext = bytearray()
 
-    x_n = master_seed & 0xFFFFFFFF
+    # Split the 256-bit master seed into an array of eight 32-bit subkeys
+    subkeys = [(master_seed >> (32 * i)) & 0xFFFFFFFF for i in range(8)]
+
+    # Initialize the state using the first 32-bit subkey
+    x_n = subkeys[0]
     prev_c = 0x00
 
-    for p in plaintext:
+    # Use enumerate to track the byte index (idx) for key cycling
+    for idx, p in enumerate(plaintext):
         z_expects = simulate_pqc(x_n)
         a_i, c_i = update_lcg_params(z_expects)
-        sbox = generate_qpp_sbox(z_expects, x_n)
+        sbox = generate_qpp_sbox(z_expects)
 
         raw_lcg_byte = (x_n >> 24) & 0xFF
 
-        # Cast the S-Box output to a standard Python int to prevent NumPy 2.0 OverflowErrors
+        # Cast the S-Box output to a standard Python int
         k_i = int(sbox[raw_lcg_byte])
 
         r_i = int(float(abs(z_expects[3])) * 7)
@@ -152,7 +123,12 @@ def encrypt(plaintext, master_seed):
         ciphertext.append(c_i_byte)
 
         prev_c = c_i_byte
-        x_n = (a_i * (x_n ^ prev_c) + c_i) % (2**32)
+
+        # KEY CYCLING: Grab the current 32-bit slice of the master seed
+        current_subkey = subkeys[idx % 8]
+
+        # Inject the subkey into the state using XOR
+        x_n = (a_i * (x_n ^ prev_c ^ current_subkey) + c_i) % (2**32)
 
     return ciphertext
 
@@ -160,14 +136,19 @@ def encrypt(plaintext, master_seed):
 def decrypt(ciphertext, master_seed):
     plaintext = bytearray()
 
-    x_n = master_seed & 0xFFFFFFFF
+    # Split the 256-bit master seed into an array of eight 32-bit subkeys
+    subkeys = [(master_seed >> (32 * i)) & 0xFFFFFFFF for i in range(8)]
+
+    # Initialize the state using the first 32-bit subkey
+    x_n = subkeys[0]
     prev_c = 0x00
 
-    for c in ciphertext:
+    # Use enumerate to track the byte index (idx) for key cycling
+    for idx, c in enumerate(ciphertext):
         z_expects = simulate_pqc(x_n)
 
         a_i, c_i = update_lcg_params(z_expects)
-        sbox = generate_qpp_sbox(z_expects, x_n)
+        sbox = generate_qpp_sbox(z_expects)
 
         raw_lcg_byte = (x_n >> 24) & 0xFF
 
@@ -183,7 +164,12 @@ def decrypt(ciphertext, master_seed):
         plaintext.append(p)
 
         prev_c = c
-        x_n = (a_i * (x_n ^ prev_c) + c_i) % (2**32)
+
+        # KEY CYCLING: Grab the current 32-bit slice of the master seed
+        current_subkey = subkeys[idx % 8]
+
+        # Inject the subkey into the state using XOR
+        x_n = (a_i * (x_n ^ prev_c ^ current_subkey) + c_i) % (2**32)
 
     return plaintext
 
@@ -244,15 +230,33 @@ if __name__ == "__main__":
 
     shared_master_seed = q_master_seed
 
-    # print(f"Original Plaintext: {message}")
+    print("\n--- Benchmarking ---")
+    total_start = time.time()
 
+    enc_start = time.time()
     encrypted_data = encrypt(message, shared_master_seed)
-    # print(f"Ciphertext (Hex):   {encrypted_data.hex()}")
+    enc_end = time.time()
+    print(f"Encryption Time: {enc_end - enc_start:.4f} seconds")
 
+    dec_start = time.time()
     decrypted_data = decrypt(encrypted_data, shared_master_seed)
-    # print(f"Decrypted Data:     {decrypted_data.decode('utf-8', errors='ignore')}")
+    dec_end = time.time()
+    print(f"Decryption Time: {dec_end - dec_start:.4f} seconds")
+
+    total_end = time.time()
+    print(
+        f"Total Overhead (including verification): {total_end - total_start:.4f} seconds"
+    )
+
+    # Change in Message Length
+    len_plain = len(message)
+    len_cipher = len(encrypted_data)
+    print(
+        f"Length Change: {len_cipher - len_plain} bytes (Plaintext: {len_plain} -> Ciphertext: {len_cipher})"
+    )
 
     assert message == decrypted_data, "Decryption failed!"
+    print("\nDecryption verified OK.")
 
     print(f"\n256-bit Quantum Seed: {hex(q_master_seed)}")
     print(f"Message Length: {len(message) / 1024:.2f} KB")
